@@ -6,8 +6,7 @@ import (
 
 	"github.com/kylar514/diglet/config"
 	"github.com/kylar514/diglet/tui"
-
-	_ "github.com/kylar514/diglet/tunnel"
+	"github.com/kylar514/diglet/tunnel"
 )
 
 func main() {
@@ -22,9 +21,10 @@ func main() {
 		os.Exit(1)
 	}
 
+	tunnel.Reconcile()
+
 	if err := tui.Run(cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "error running ui: %v\n", err)
 		os.Exit(1)
 	}
 }
-

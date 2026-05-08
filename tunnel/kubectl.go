@@ -8,12 +8,18 @@ import (
 )
 
 func init() {
-	Register("kubectl", func(conn config.Connection) *exec.Cmd {
-		portArg := fmt.Sprintf("%d:localhost:%d", conn.LocalPort, conn.RemotePort)
-		return exec.Command("kubectl", "port-forward",
-			"svc/"+conn.Service,
-			portArg,
-			"-n", conn.Namespace,
-		)
+	Register("kubectl", func(conn config.Connection) (*exec.Cmd, error) {
+		resource := conn.Resource
+		if resource == "" {
+			return nil, fmt.Errorf("kubectl tunnel %q requires 'resource' to be set (e.g. svc/my-service or pod/my-pod)", conn.Name)
+		}
+
+		portArg := fmt.Sprintf("%d:%d", conn.LocalPort, conn.RemotePort)
+		args := []string{"port-forward", resource, portArg}
+		if conn.Namespace != "" {
+			args = append(args, "-n", conn.Namespace)
+		}
+
+		return exec.Command("kubectl", args...), nil
 	})
 }

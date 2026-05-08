@@ -11,8 +11,8 @@ import (
 type Connection struct {
 	Name       string `yaml:"name"`
 	TunnelType string `yaml:"tunnel_type"`
+	Resource   string `yaml:"resource"`
 	Namespace  string `yaml:"namespace"`
-	Service    string `yaml:"service"`
 	Container  string `yaml:"container"`
 	SSHHost    string `yaml:"ssh_host"`
 	RemotePort int    `yaml:"remote_port"`

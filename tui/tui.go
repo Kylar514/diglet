@@ -13,11 +13,13 @@ import (
 )
 
 var (
-	activeStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("2")).Bold(true)
-	dimStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-	cursorStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("4")).Bold(true)
-	titleStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("5")).Bold(true)
-	previewStyle = lipgloss.NewStyle().
+	activeStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("2")).Bold(true)
+	connectingStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("3")).Bold(true)
+	dimStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	cursorStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("4")).Bold(true)
+	titleStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("5")).Bold(true)
+	errorStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("1")).Bold(true)
+	previewStyle    = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(lipgloss.Color("8")).
 			Padding(0, 1)
@@ -34,6 +36,11 @@ const (
 	modeFilter
 )
 
+type tunnelReadyMsg struct {
+	name string
+	err  error
+}
+
 type model struct {
 	connections []config.Connection
 	filtered    []config.Connection
@@ -41,6 +48,8 @@ type model struct {
 	mode        mode
 	filter      textinput.Model
 	sortType    string
+	statusMsg   string
+	connecting  map[string]bool
 	width       int
 	height      int
 }
@@ -55,6 +64,7 @@ func newModel(cfg *config.Config) model {
 		filtered:    cfg.Connections,
 		filter:      ti,
 		sortType:    "all",
+		connecting:  make(map[string]bool),
 	}
 }
 
@@ -98,13 +108,38 @@ func (m *model) applySort() {
 	m.cursor = 0
 }
 
+func startTunnel(conn config.Connection) tea.Cmd {
+	return func() tea.Msg {
+		if err := tunnel.StartProcess(conn); err != nil {
+			return tunnelReadyMsg{name: conn.Name, err: err}
+		}
+		if err := tunnel.Probe(conn.LocalPort); err != nil {
+			tunnel.Abort(conn.Name)
+			return tunnelReadyMsg{name: conn.Name, err: err}
+		}
+		if err := tunnel.Confirm(conn.Name); err != nil {
+			_ = err
+		}
+		return tunnelReadyMsg{name: conn.Name, err: nil}
+	}
+}
+
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case tunnelReadyMsg:
+		delete(m.connecting, msg.name)
+		if msg.err != nil {
+			m.statusMsg = fmt.Sprintf("%s: %s", msg.name, msg.err.Error())
+		}
+		return m, nil
+
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
 
 	case tea.KeyMsg:
+		m.statusMsg = ""
+
 		if m.mode == modeFilter {
 			switch msg.String() {
 			case "esc":
@@ -165,11 +200,21 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			conn := m.filtered[m.cursor]
-			if tunnel.IsActive(conn.Name) {
-				tunnel.Stop(conn.Name)
-			} else {
-				tunnel.Start(conn)
+
+			// Don't allow double-toggling while a probe is in flight.
+			if m.connecting[conn.Name] {
+				return m, nil
 			}
+
+			if tunnel.IsActive(conn.Name) {
+				if err := tunnel.Stop(conn.Name); err != nil {
+					m.statusMsg = err.Error()
+				}
+				return m, nil
+			}
+
+			m.connecting[conn.Name] = true
+			return m, startTunnel(conn)
 		}
 	}
 
@@ -182,25 +227,39 @@ func buildCommand(conn config.Connection) string {
 		return fmt.Sprintf("ssh -L %d:localhost:%d -N %s",
 			conn.LocalPort, conn.RemotePort, conn.SSHHost)
 	case "kubectl":
-		return fmt.Sprintf("kubectl port-forward svc/%s %d:%d -n %s",
-			conn.Service, conn.LocalPort, conn.RemotePort, conn.Namespace)
+		resource := conn.Resource
+		if resource == "" {
+			resource = "(resource not set)"
+		}
+		ns := ""
+		if conn.Namespace != "" {
+			ns = " -n " + conn.Namespace
+		}
+		return fmt.Sprintf("kubectl port-forward %s %d:%d%s",
+			resource, conn.LocalPort, conn.RemotePort, ns)
 	case "docker":
-		return fmt.Sprintf("docker port %s %d:%d",
-			conn.Container, conn.LocalPort, conn.RemotePort)
+		return "docker  (not yet implemented)"
 	default:
 		return "unknown tunnel type"
 	}
 }
 
-func (m model) renderPreview() string {
+func (m *model) renderPreview(width, height int) string {
+	previewStyle := previewStyle.Width(width).Height(height)
 	if len(m.filtered) == 0 {
 		return previewStyle.Render(dimStyle.Render("no connections"))
 	}
 
 	conn := m.filtered[m.cursor]
-	status := dimStyle.Render("● inactive")
-	if tunnel.IsActive(conn.Name) {
+
+	var status string
+	switch {
+	case m.connecting[conn.Name]:
+		status = connectingStyle.Render("◌ connecting...")
+	case tunnel.IsActive(conn.Name):
 		status = activeStyle.Render("● active")
+	default:
+		status = dimStyle.Render("● inactive")
 	}
 
 	var sb strings.Builder
@@ -211,8 +270,10 @@ func (m model) renderPreview() string {
 	case "ssh":
 		sb.WriteString(fmt.Sprintf("%-12s %s\n", "host:", conn.SSHHost))
 	case "kubectl":
-		sb.WriteString(fmt.Sprintf("%-12s %s\n", "namespace:", conn.Namespace))
-		sb.WriteString(fmt.Sprintf("%-12s %s\n", "service:", conn.Service))
+		sb.WriteString(fmt.Sprintf("%-12s %s\n", "resource:", conn.Resource))
+		if conn.Namespace != "" {
+			sb.WriteString(fmt.Sprintf("%-12s %s\n", "namespace:", conn.Namespace))
+		}
 	case "docker":
 		sb.WriteString(fmt.Sprintf("%-12s %s\n", "container:", conn.Container))
 	}
@@ -227,7 +288,8 @@ func (m model) renderPreview() string {
 	return previewStyle.Render(sb.String())
 }
 
-func (m model) renderList() string {
+func (m *model) renderList(width, height int) string {
+	listStyle := listStyle.Width(width).Height(height)
 	var sb strings.Builder
 	sb.WriteString(titleStyle.Render("connections") + "\n\n")
 
@@ -237,11 +299,17 @@ func (m model) renderList() string {
 			cursor = cursorStyle.Render("▶ ")
 		}
 
-		name := conn.Name
-		indicator := dimStyle.Render("○")
-		if tunnel.IsActive(conn.Name) {
+		var indicator, name string
+		switch {
+		case m.connecting[conn.Name]:
+			indicator = connectingStyle.Render("◌")
+			name = connectingStyle.Render(conn.Name)
+		case tunnel.IsActive(conn.Name):
 			indicator = activeStyle.Render("●")
-			name = activeStyle.Render(name)
+			name = activeStyle.Render(conn.Name)
+		default:
+			indicator = dimStyle.Render("○")
+			name = conn.Name
 		}
 
 		typeTag := dimStyle.Render("[" + conn.TunnelType + "]")
@@ -252,7 +320,11 @@ func (m model) renderList() string {
 	if m.mode == modeFilter {
 		sb.WriteString("/" + m.filter.View())
 	} else {
-		sb.WriteString(dimStyle.Render("/ filter  s sort  enter toggle  q quit"))
+		statusLine := dimStyle.Render("/ filter  s sort  enter toggle  q quit")
+		if m.statusMsg != "" {
+			statusLine = errorStyle.Render("! " + m.statusMsg)
+		}
+		sb.WriteString(statusLine)
 	}
 
 	return listStyle.Render(sb.String())
@@ -263,8 +335,10 @@ func (m *model) View() string {
 		return "loading..."
 	}
 
-	list := m.renderList()
-	preview := m.renderPreview()
+	halfWidth := m.width/2 - 2
+
+	list := m.renderList(halfWidth, m.height-2)
+	preview := m.renderPreview(halfWidth, m.height-2)
 
 	return lipgloss.JoinHorizontal(lipgloss.Top, list, preview)
 }
