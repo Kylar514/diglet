@@ -23,7 +23,7 @@ func main() {
 
 	tunnel.Reconcile()
 
-	if err := tui.Run(cfg); err != nil {
+	if err := tui.Run(cfg, cfgPath); err != nil {
 		fmt.Fprintf(os.Stderr, "error running ui: %v\n", err)
 		os.Exit(1)
 	}

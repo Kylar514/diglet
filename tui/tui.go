@@ -2,6 +2,8 @@ package tui
 
 import (
 	"fmt"
+	"os"
+	"os/exec"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -44,6 +46,9 @@ type tunnelReadyMsg struct {
 	err  error
 }
 
+// editorFinishedMsg is sent back to Update() after the editor process exits.
+type editorFinishedMsg struct{ err error }
+
 type model struct {
 	connections []config.Connection
 	filtered    []config.Connection
@@ -54,11 +59,12 @@ type model struct {
 	typeFilter  string
 	statusMsg   string
 	connecting  map[string]bool
+	cfgPath     string
 	width       int
 	height      int
 }
 
-func newModel(cfg *config.Config) model {
+func newModel(cfg *config.Config, cfgPath string) model {
 	ti := textinput.New()
 	ti.Placeholder = "fuzzy filter..."
 	ti.CharLimit = 64
@@ -69,6 +75,7 @@ func newModel(cfg *config.Config) model {
 		filter:      ti,
 		typeFilter:  "all",
 		connecting:  make(map[string]bool),
+		cfgPath:     cfgPath,
 	}
 }
 
@@ -137,6 +144,24 @@ func (m *model) applyTypeFilter() {
 	m.cursor = 0
 }
 
+// openEditor suspends the TUI, opens $EDITOR on the config file, then resumes.
+// The result is delivered back as an editorFinishedMsg.
+func openEditor(cfgPath string) tea.Cmd {
+	editor := os.Getenv("EDITOR")
+	if editor == "" {
+		editor = os.Getenv("VISUAL")
+	}
+	if editor == "" {
+		// Return a plain function that sends the error as a msg — no exec needed.
+		return func() tea.Msg {
+			return editorFinishedMsg{err: fmt.Errorf("$EDITOR is not set")}
+		}
+	}
+	return tea.ExecProcess(exec.Command(editor, cfgPath), func(err error) tea.Msg {
+		return editorFinishedMsg{err: err}
+	})
+}
+
 // startTunnel returns a tea.Cmd that launches the tunnel process then probes
 // the local port. The result is delivered back as a tunnelReadyMsg.
 func startTunnel(conn config.Connection) tea.Cmd {
@@ -161,6 +186,29 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		delete(m.connecting, msg.name)
 		if msg.err != nil {
 			m.statusMsg = fmt.Sprintf("%s: %s", msg.name, msg.err.Error())
+		}
+		return m, nil
+
+	case editorFinishedMsg:
+		if msg.err != nil {
+			m.statusMsg = fmt.Sprintf("editor: %s", msg.err.Error())
+			return m, nil
+		}
+		// Reload config; on parse error keep existing connections and show error.
+		newCfg, err := config.Load(m.cfgPath)
+		if err != nil {
+			m.statusMsg = fmt.Sprintf("config reload failed: %s", err.Error())
+			return m, nil
+		}
+		m.connections = newCfg.Connections
+		// Re-apply current filters so the list reflects the updated config.
+		m.applyTypeFilter()
+		if m.filter.Value() != "" {
+			m.applyFilter()
+		}
+		// Clamp cursor in case the list shrank.
+		if m.cursor >= len(m.filtered) {
+			m.cursor = max(0, len(m.filtered)-1)
 		}
 		return m, nil
 
@@ -244,6 +292,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.mode = modeFilter
 			m.filter.Focus()
 			return m, textinput.Blink
+
+		case "e":
+			return m, openEditor(m.cfgPath)
 
 		case "t":
 			m.mode = modeType
@@ -472,6 +523,7 @@ func (m *model) renderList(width, height int) string {
 			hotkey("/", "search") + "   " +
 				hotkey("t", "type") + "   " +
 				hotkey("↵", "connect") + "   " +
+				hotkey("e", "edit") + "   " +
 				hotkey("q", "quit"),
 		)
 	}
@@ -492,8 +544,8 @@ func (m *model) View() string {
 	return lipgloss.JoinHorizontal(lipgloss.Top, list, preview)
 }
 
-func Run(cfg *config.Config) error {
-	m := newModel(cfg)
+func Run(cfg *config.Config, cfgPath string) error {
+	m := newModel(cfg, cfgPath)
 	p := tea.NewProgram(&m, tea.WithAltScreen())
 	_, err := p.Run()
 	return err
