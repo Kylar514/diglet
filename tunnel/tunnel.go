@@ -122,3 +122,23 @@ func RegisteredTypes() []string {
 	sort.Strings(types)
 	return types
 }
+
+// GetPid returns the PID of the named active tunnel, or 0 if not active.
+func GetPid(name string) int {
+	if t, exists := active[name]; exists {
+		return t.Pid
+	}
+	return 0
+}
+
+// StopAll stops every active tunnel. Returns a slice of any errors encountered.
+// Tunnels that fail to stop are left in the active map.
+func StopAll() []error {
+	var errs []error
+	for name := range active {
+		if err := Stop(name); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errs
+}

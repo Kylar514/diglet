@@ -144,17 +144,24 @@ func (m *model) applyTypeFilter() {
 	m.cursor = 0
 }
 
-// openEditor suspends the TUI, opens $EDITOR on the config file, then resumes.
-// The result is delivered back as an editorFinishedMsg.
+// openEditor suspends the TUI, opens the best available editor on the config
+// file, then resumes. Preference: $EDITOR → $VISUAL → vim → vi → error.
 func openEditor(cfgPath string) tea.Cmd {
 	editor := os.Getenv("EDITOR")
 	if editor == "" {
 		editor = os.Getenv("VISUAL")
 	}
 	if editor == "" {
-		// Return a plain function that sends the error as a msg — no exec needed.
+		for _, candidate := range []string{"vim", "vi"} {
+			if _, err := exec.LookPath(candidate); err == nil {
+				editor = candidate
+				break
+			}
+		}
+	}
+	if editor == "" {
 		return func() tea.Msg {
-			return editorFinishedMsg{err: fmt.Errorf("$EDITOR is not set")}
+			return editorFinishedMsg{err: fmt.Errorf("no editor found: set $EDITOR or install vim")}
 		}
 	}
 	return tea.ExecProcess(exec.Command(editor, cfgPath), func(err error) tea.Msg {
@@ -296,6 +303,15 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "e":
 			return m, openEditor(m.cfgPath)
 
+		case "K":
+			errs := tunnel.StopAll()
+			if len(errs) == 0 {
+				m.statusMsg = "all tunnels stopped"
+			} else {
+				m.statusMsg = fmt.Sprintf("stopped with %d error(s): %s", len(errs), errs[0].Error())
+			}
+			return m, nil
+
 		case "t":
 			m.mode = modeType
 			// Position the type cursor on the currently active filter.
@@ -432,6 +448,12 @@ func (m *model) renderPreview(width, height int) string {
 
 	sb.WriteString(fmt.Sprintf("%-12s %d → %d\n", dimStyle.Render("ports"), conn.LocalPort, conn.RemotePort))
 	sb.WriteString(fmt.Sprintf("%-12s %s\n", dimStyle.Render("status"), status))
+	pid := tunnel.GetPid(conn.Name)
+	pidStr := "n/a"
+	if pid > 0 {
+		pidStr = fmt.Sprintf("%d", pid)
+	}
+	sb.WriteString(fmt.Sprintf("%-12s %s\n", dimStyle.Render("pid"), pidStr))
 	sb.WriteString("\n")
 	sb.WriteString(dimStyle.Render("command") + "\n")
 	sb.WriteString(dimStyle.Render("  "+buildCommand(conn)) + "\n")
@@ -523,6 +545,7 @@ func (m *model) renderList(width, height int) string {
 			hotkey("/", "search") + "   " +
 				hotkey("t", "type") + "   " +
 				hotkey("↵", "connect") + "   " +
+				hotkey("K", "kill all") + "   " +
 				hotkey("e", "edit") + "   " +
 				hotkey("q", "quit"),
 		)
