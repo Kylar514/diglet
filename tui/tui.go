@@ -17,8 +17,9 @@ var (
 	connectingStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("3")).Bold(true)
 	dimStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 	cursorStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("4")).Bold(true)
-	titleStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("5")).Bold(true)
+	titleStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("15")).Bold(true)
 	errorStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("1")).Bold(true)
+	keyStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("15")).Bold(true)
 	previewStyle    = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(lipgloss.Color("8")).
@@ -34,8 +35,10 @@ type mode int
 const (
 	modeNormal mode = iota
 	modeFilter
+	modeType
 )
 
+// tunnelReadyMsg is sent back to Update() from the async probe goroutine.
 type tunnelReadyMsg struct {
 	name string
 	err  error
@@ -45,9 +48,10 @@ type model struct {
 	connections []config.Connection
 	filtered    []config.Connection
 	cursor      int
+	typeCursor  int
 	mode        mode
 	filter      textinput.Model
-	sortType    string
+	typeFilter  string
 	statusMsg   string
 	connecting  map[string]bool
 	width       int
@@ -63,7 +67,7 @@ func newModel(cfg *config.Config) model {
 		connections: cfg.Connections,
 		filtered:    cfg.Connections,
 		filter:      ti,
-		sortType:    "all",
+		typeFilter:  "all",
 		connecting:  make(map[string]bool),
 	}
 }
@@ -72,42 +76,69 @@ func (m *model) Init() tea.Cmd {
 	return nil
 }
 
+// typeList returns the full ordered list of selectable type entries: "all" first,
+// then registered tunnel types alphabetically.
+func (m *model) typeList() []string {
+	return append([]string{"all"}, tunnel.RegisteredTypes()...)
+}
+
+// typeCount returns the number of connections matching a given type ("all" returns total).
+func (m *model) typeCount(t string) int {
+	if t == "all" {
+		return len(m.connections)
+	}
+	n := 0
+	for _, c := range m.connections {
+		if c.TunnelType == t {
+			n++
+		}
+	}
+	return n
+}
+
+// connectionsOfType returns all connections matching a given type ("all" returns all).
+func (m *model) connectionsOfType(t string) []config.Connection {
+	if t == "all" {
+		return m.connections
+	}
+	out := make([]config.Connection, 0)
+	for _, c := range m.connections {
+		if c.TunnelType == t {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
 func (m *model) applyFilter() {
 	query := m.filter.Value()
+	base := m.connectionsOfType(m.typeFilter)
 	if query == "" {
-		m.filtered = m.connections
+		m.filtered = base
 		m.cursor = 0
 		return
 	}
 
-	names := make([]string, len(m.connections))
-	for i, c := range m.connections {
+	names := make([]string, len(base))
+	for i, c := range base {
 		names[i] = c.Name
 	}
 
 	matches := fuzzy.Find(query, names)
 	m.filtered = make([]config.Connection, 0, len(matches))
 	for _, match := range matches {
-		m.filtered = append(m.filtered, m.connections[match.Index])
+		m.filtered = append(m.filtered, base[match.Index])
 	}
 	m.cursor = 0
 }
 
-func (m *model) applySort() {
-	if m.sortType == "all" {
-		m.filtered = m.connections
-		return
-	}
-	filtered := make([]config.Connection, 0)
-	for _, c := range m.connections {
-		if c.TunnelType == m.sortType {
-			filtered = append(filtered, c)
-		}
-	}
-	m.filtered = filtered
+func (m *model) applyTypeFilter() {
+	m.filtered = m.connectionsOfType(m.typeFilter)
 	m.cursor = 0
 }
 
+// startTunnel returns a tea.Cmd that launches the tunnel process then probes
+// the local port. The result is delivered back as a tunnelReadyMsg.
 func startTunnel(conn config.Connection) tea.Cmd {
 	return func() tea.Msg {
 		if err := tunnel.StartProcess(conn); err != nil {
@@ -140,14 +171,14 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		m.statusMsg = ""
 
+		// --- filter mode ---
 		if m.mode == modeFilter {
 			switch msg.String() {
 			case "esc":
 				m.mode = modeNormal
 				m.filter.Blur()
 				m.filter.SetValue("")
-				m.filtered = m.connections
-				m.cursor = 0
+				m.applyTypeFilter()
 				return m, nil
 			case "enter":
 				m.mode = modeNormal
@@ -160,6 +191,35 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 
+		// --- type mode ---
+		if m.mode == modeType {
+			types := m.typeList()
+			switch msg.String() {
+			case "esc", "t":
+				m.mode = modeNormal
+			case "j":
+				if m.typeCursor < len(types)-1 {
+					m.typeCursor++
+				}
+			case "k":
+				if m.typeCursor > 0 {
+					m.typeCursor--
+				}
+			case "g":
+				m.typeCursor = 0
+			case "G":
+				m.typeCursor = len(types) - 1
+			case "enter":
+				m.typeFilter = types[m.typeCursor]
+				m.applyTypeFilter()
+				// Clear any active fuzzy filter when switching type.
+				m.filter.SetValue("")
+				m.mode = modeNormal
+			}
+			return m, nil
+		}
+
+		// --- normal mode ---
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
@@ -185,15 +245,16 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.filter.Focus()
 			return m, textinput.Blink
 
-		case "s":
-			types := append([]string{"all"}, tunnel.RegisteredTypes()...)
+		case "t":
+			m.mode = modeType
+			// Position the type cursor on the currently active filter.
+			types := m.typeList()
 			for i, t := range types {
-				if t == m.sortType {
-					m.sortType = types[(i+1)%len(types)]
+				if t == m.typeFilter {
+					m.typeCursor = i
 					break
 				}
 			}
-			m.applySort()
 
 		case "enter":
 			if len(m.filtered) == 0 {
@@ -201,7 +262,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			conn := m.filtered[m.cursor]
 
-			// Don't allow double-toggling while a probe is in flight.
 			if m.connecting[conn.Name] {
 				return m, nil
 			}
@@ -221,6 +281,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// hotkey renders a single [key] label pair.
+func hotkey(key, label string) string {
+	return keyStyle.Render("["+key+"]") + " " + dimStyle.Render(label)
+}
+
+// buildCommand returns the CLI command string for the preview pane.
 func buildCommand(conn config.Connection) string {
 	switch conn.TunnelType {
 	case "ssh":
@@ -245,9 +311,44 @@ func buildCommand(conn config.Connection) string {
 }
 
 func (m *model) renderPreview(width, height int) string {
-	previewStyle := previewStyle.Width(width).Height(height)
+	ps := previewStyle.Width(width).Height(height)
+
+	// In type mode: show the connections belonging to the hovered type.
+	if m.mode == modeType {
+		types := m.typeList()
+		hovered := types[m.typeCursor]
+		conns := m.connectionsOfType(hovered)
+
+		var sb strings.Builder
+		label := hovered
+		if hovered == "all" {
+			label = "all types"
+		}
+		sb.WriteString(titleStyle.Render(label) + "\n\n")
+
+		if len(conns) == 0 {
+			sb.WriteString(dimStyle.Render("no connections of this type"))
+		} else {
+			for _, c := range conns {
+				var indicator string
+				switch {
+				case m.connecting[c.Name]:
+					indicator = connectingStyle.Render("◌")
+				case tunnel.IsActive(c.Name):
+					indicator = activeStyle.Render("●")
+				default:
+					indicator = dimStyle.Render("○")
+				}
+				sb.WriteString(fmt.Sprintf("%s  %s\n", indicator, c.Name))
+			}
+		}
+
+		return ps.Render(sb.String())
+	}
+
+	// Normal / filter mode: show the selected connection detail.
 	if len(m.filtered) == 0 {
-		return previewStyle.Render(dimStyle.Render("no connections"))
+		return ps.Render(dimStyle.Render("no connections"))
 	}
 
 	conn := m.filtered[m.cursor]
@@ -264,34 +365,80 @@ func (m *model) renderPreview(width, height int) string {
 
 	var sb strings.Builder
 	sb.WriteString(titleStyle.Render(conn.Name) + "\n\n")
-	sb.WriteString(fmt.Sprintf("%-12s %s\n", "type:", conn.TunnelType))
+	sb.WriteString(fmt.Sprintf("%-12s %s\n", dimStyle.Render("type"), conn.TunnelType))
 
 	switch conn.TunnelType {
 	case "ssh":
-		sb.WriteString(fmt.Sprintf("%-12s %s\n", "host:", conn.SSHHost))
+		sb.WriteString(fmt.Sprintf("%-12s %s\n", dimStyle.Render("host"), conn.SSHHost))
 	case "kubectl":
-		sb.WriteString(fmt.Sprintf("%-12s %s\n", "resource:", conn.Resource))
+		sb.WriteString(fmt.Sprintf("%-12s %s\n", dimStyle.Render("resource"), conn.Resource))
 		if conn.Namespace != "" {
-			sb.WriteString(fmt.Sprintf("%-12s %s\n", "namespace:", conn.Namespace))
+			sb.WriteString(fmt.Sprintf("%-12s %s\n", dimStyle.Render("namespace"), conn.Namespace))
 		}
 	case "docker":
-		sb.WriteString(fmt.Sprintf("%-12s %s\n", "container:", conn.Container))
+		sb.WriteString(fmt.Sprintf("%-12s %s\n", dimStyle.Render("container"), conn.Container))
 	}
 
-	sb.WriteString(fmt.Sprintf("%-12s %d → %d\n", "ports:", conn.LocalPort, conn.RemotePort))
+	sb.WriteString(fmt.Sprintf("%-12s %d → %d\n", dimStyle.Render("ports"), conn.LocalPort, conn.RemotePort))
+	sb.WriteString(fmt.Sprintf("%-12s %s\n", dimStyle.Render("status"), status))
 	sb.WriteString("\n")
-	sb.WriteString(dimStyle.Render("command:") + "\n")
-	sb.WriteString(buildCommand(conn) + "\n")
-	sb.WriteString("\n")
-	sb.WriteString(fmt.Sprintf("%-12s %s\n", "status:", status))
+	sb.WriteString(dimStyle.Render("command") + "\n")
+	sb.WriteString(dimStyle.Render("  "+buildCommand(conn)) + "\n")
 
-	return previewStyle.Render(sb.String())
+	if m.statusMsg != "" {
+		sb.WriteString("\n")
+		sb.WriteString(errorStyle.Render("! " + m.statusMsg))
+	}
+
+	return ps.Render(sb.String())
 }
 
 func (m *model) renderList(width, height int) string {
-	listStyle := listStyle.Width(width).Height(height)
+	ls := listStyle.Width(width).Height(height)
 	var sb strings.Builder
-	sb.WriteString(titleStyle.Render("connections") + "\n\n")
+
+	// --- type mode ---
+	if m.mode == modeType {
+		types := m.typeList()
+		sb.WriteString(titleStyle.Render("type filter") +
+			"  " + dimStyle.Render(fmt.Sprintf("[%d]", len(types))) + "\n\n")
+
+		for i, t := range types {
+			cursor := "  "
+			if i == m.typeCursor {
+				cursor = cursorStyle.Render("▶ ")
+			}
+
+			indicator := dimStyle.Render("○")
+			label := t
+			if t == m.typeFilter {
+				indicator = activeStyle.Render("●")
+				label = activeStyle.Render(t)
+			}
+
+			count := dimStyle.Render(fmt.Sprintf("(%d)", m.typeCount(t)))
+			sb.WriteString(fmt.Sprintf("%s%s  %-12s %s\n", cursor, indicator, label, count))
+		}
+
+		sb.WriteString("\n")
+		sb.WriteString(hotkey("↵", "select") + "   " + hotkey("esc", "cancel"))
+		return ls.Render(sb.String())
+	}
+
+	// --- normal / filter mode ---
+	total := len(m.connections)
+	shown := len(m.filtered)
+	header := titleStyle.Render("connections")
+	if m.mode == modeFilter && m.filter.Value() != "" {
+		header += "  " + dimStyle.Render(fmt.Sprintf("[%d/%d]", shown, total)) +
+			"  " + dimStyle.Render(`"`+m.filter.Value()+`"`)
+	} else if m.typeFilter != "all" {
+		header += "  " + dimStyle.Render(fmt.Sprintf("[%d/%d]", shown, total)) +
+			"  " + dimStyle.Render("· "+m.typeFilter)
+	} else {
+		header += "  " + dimStyle.Render(fmt.Sprintf("[%d]", total))
+	}
+	sb.WriteString(header + "\n\n")
 
 	for i, conn := range m.filtered {
 		cursor := "  "
@@ -318,16 +465,18 @@ func (m *model) renderList(width, height int) string {
 
 	sb.WriteString("\n")
 	if m.mode == modeFilter {
-		sb.WriteString("/" + m.filter.View())
+		sb.WriteString(dimStyle.Render("/") + " " + m.filter.View() + "\n")
+		sb.WriteString(hotkey("↵", "confirm") + "   " + hotkey("esc", "cancel"))
 	} else {
-		statusLine := dimStyle.Render("/ filter  s sort  enter toggle  q quit")
-		if m.statusMsg != "" {
-			statusLine = errorStyle.Render("! " + m.statusMsg)
-		}
-		sb.WriteString(statusLine)
+		sb.WriteString(
+			hotkey("/", "search") + "   " +
+				hotkey("t", "type") + "   " +
+				hotkey("↵", "connect") + "   " +
+				hotkey("q", "quit"),
+		)
 	}
 
-	return listStyle.Render(sb.String())
+	return ls.Render(sb.String())
 }
 
 func (m *model) View() string {

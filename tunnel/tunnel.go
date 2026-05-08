@@ -3,6 +3,7 @@ package tunnel
 import (
 	"fmt"
 	"os/exec"
+	"sort"
 	"syscall"
 
 	"github.com/kylar514/diglet/config"
@@ -118,5 +119,6 @@ func RegisteredTypes() []string {
 	for k := range builders {
 		types = append(types, k)
 	}
+	sort.Strings(types)
 	return types
 }
