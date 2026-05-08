@@ -6,6 +6,8 @@
 
 TUI tunnel manager — start, stop, and monitor SSH, kubectl, and Docker port-forward tunnels from your terminal.
 
+<img width="807" height="605" alt="image" src="https://github.com/user-attachments/assets/0e6ed88d-2662-4163-ab21-1712854ab90f" />
+
 ## Install
 
 ```bash
