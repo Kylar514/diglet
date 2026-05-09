@@ -199,27 +199,26 @@ func Reconcile() {
 // RunProbe is the entrypoint for the `diglet probe` subprocess.
 // It probes localPort, updates the state file, and sends notifications.
 func RunProbe(name string, localPort int) {
-	Notify("diglet", name+": connecting...")
+	NotifySync("diglet", name+": connecting...")
 
 	if err := Probe(localPort); err != nil {
-		// Probe timed out — remove the entry and notify failure.
+		// Probe timed out — read pid before removing the entry.
+		sf := readStateFile()
 		_ = RemoveEntry(name)
-		// Kill the tunnel process using the pid from the state file.
-		sf := readStateFile() // entry may already be gone if user stopped it
 		if entry, ok := sf.Tunnels[name]; ok {
 			_ = syscall.Kill(-entry.Pid, syscall.SIGKILL)
 			_ = syscall.Kill(entry.Pid, syscall.SIGKILL)
 		}
-		Notify("diglet", name+": failed to connect")
+		NotifySync("diglet", name+": failed to connect")
 		return
 	}
 
 	// Port is up — mark active in state file.
 	if err := UpdateEntryStatus(name, stateActive); err != nil {
-		Notify("diglet", name+": failed to update state")
+		NotifySync("diglet", name+": failed to update state")
 		return
 	}
-	Notify("diglet", name+": connected")
+	NotifySync("diglet", name+": connected")
 }
 
 // pidAlive returns true if the process with the given PID is running.
