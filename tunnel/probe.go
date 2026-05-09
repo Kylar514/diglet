@@ -7,7 +7,7 @@ import (
 )
 
 const (
-	probeTimeout  = 5 * time.Second
+	probeTimeout  = 30 * time.Second
 	probeInterval = 100 * time.Millisecond
 )
 

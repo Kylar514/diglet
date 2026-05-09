@@ -10,10 +10,18 @@ import (
 	"github.com/kylar514/diglet/config"
 )
 
+type TunnelStatus int
+
+const (
+	StatusConnecting TunnelStatus = iota
+	StatusActive
+)
+
 type ActiveTunnel struct {
 	Connection config.Connection
 	Cmd        *exec.Cmd
 	Pid        int
+	Status     TunnelStatus
 }
 
 var (
@@ -44,30 +52,21 @@ func StartProcess(conn config.Connection) error {
 	}
 
 	mu.Lock()
-	defer mu.Unlock()
-
 	if _, exists := active[conn.Name]; exists {
+		mu.Unlock()
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		_ = syscall.Kill(cmd.Process.Pid, syscall.SIGKILL)
 		return fmt.Errorf("tunnel %q already active", conn.Name)
 	}
-
 	active[conn.Name] = &ActiveTunnel{
 		Connection: conn,
 		Cmd:        cmd,
 		Pid:        cmd.Process.Pid,
+		Status:     StatusConnecting,
 	}
+	mu.Unlock()
 
-	return nil
-}
-
-func Confirm(name string) error {
-	mu.RLock()
-	_, exists := active[name]
-	mu.RUnlock()
-	if !exists {
-		return fmt.Errorf("no active tunnel named %q", name)
-	}
+	// Persist the connecting entry immediately so it survives TUI restarts.
 	return saveState()
 }
 
@@ -123,11 +122,21 @@ func List() []*ActiveTunnel {
 	return tunnels
 }
 
+// IsActive returns true only if the tunnel is fully connected (StatusActive).
 func IsActive(name string) bool {
 	mu.RLock()
 	defer mu.RUnlock()
-	_, exists := active[name]
-	return exists
+	t, exists := active[name]
+	return exists && t.Status == StatusActive
+}
+
+// IsConnecting returns true if the tunnel process is running but the probe
+// has not yet completed.
+func IsConnecting(name string) bool {
+	mu.RLock()
+	defer mu.RUnlock()
+	t, exists := active[name]
+	return exists && t.Status == StatusConnecting
 }
 
 func RegisteredTypes() []string {

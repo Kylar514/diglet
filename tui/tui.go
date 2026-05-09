@@ -4,7 +4,10 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -40,8 +43,12 @@ const (
 	modeType
 )
 
-// tunnelReadyMsg is sent back to Update() from the async probe goroutine.
-type tunnelReadyMsg struct {
+// tickMsg is sent by the polling ticker to trigger a state file refresh.
+type tickMsg struct{}
+
+// tunnelStartedMsg is sent back to Update() immediately after the OS process
+// is spawned. A non-nil err means the process failed to start.
+type tunnelStartedMsg struct {
 	name string
 	err  error
 }
@@ -58,7 +65,6 @@ type model struct {
 	filter      textinput.Model
 	typeFilter  string
 	statusMsg   string
-	connecting  map[string]bool
 	cfgPath     string
 	width       int
 	height      int
@@ -74,13 +80,19 @@ func newModel(cfg *config.Config, cfgPath string) model {
 		filtered:    cfg.Connections,
 		filter:      ti,
 		typeFilter:  "all",
-		connecting:  make(map[string]bool),
 		cfgPath:     cfgPath,
 	}
 }
 
 func (m *model) Init() tea.Cmd {
-	return nil
+	return tick()
+}
+
+// tick returns a tea.Cmd that fires a tickMsg after 500ms.
+func tick() tea.Cmd {
+	return tea.Tick(500*time.Millisecond, func(time.Time) tea.Msg {
+		return tickMsg{}
+	})
 }
 
 // typeList returns the full ordered list of selectable type entries: "all" first,
@@ -169,28 +181,38 @@ func openEditor(cfgPath string) tea.Cmd {
 	})
 }
 
-// startTunnel returns a tea.Cmd that launches the tunnel process then probes
-// the local port. The result is delivered back as a tunnelReadyMsg.
+// startTunnel spawns the tunnel OS process and a detached probe subprocess,
+// then returns immediately. The probe subprocess survives the TUI being closed
+// and updates the state file when the connection succeeds or fails.
 func startTunnel(conn config.Connection) tea.Cmd {
 	return func() tea.Msg {
 		if err := tunnel.StartProcess(conn); err != nil {
-			return tunnelReadyMsg{name: conn.Name, err: err}
+			return tunnelStartedMsg{name: conn.Name, err: err}
 		}
-		if err := tunnel.Probe(conn.LocalPort); err != nil {
-			tunnel.Abort(conn.Name)
-			return tunnelReadyMsg{name: conn.Name, err: err}
+
+		// Spawn a detached `diglet probe <name> <port>` subprocess.
+		// Setpgid isolates it from the TUI process group so it survives `q`.
+		exe, err := os.Executable()
+		if err != nil {
+			return tunnelStartedMsg{name: conn.Name, err: fmt.Errorf("could not locate executable: %w", err)}
 		}
-		if err := tunnel.Confirm(conn.Name); err != nil {
-			_ = err
+		probe := exec.Command(exe, "probe", conn.Name, strconv.Itoa(conn.LocalPort))
+		probe.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		if err := probe.Start(); err != nil {
+			return tunnelStartedMsg{name: conn.Name, err: fmt.Errorf("could not start probe: %w", err)}
 		}
-		return tunnelReadyMsg{name: conn.Name, err: nil}
+
+		return tunnelStartedMsg{name: conn.Name, err: nil}
 	}
 }
 
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
-	case tunnelReadyMsg:
-		delete(m.connecting, msg.name)
+	case tickMsg:
+		tunnel.RefreshFromState()
+		return m, tick()
+
+	case tunnelStartedMsg:
 		if msg.err != nil {
 			m.statusMsg = fmt.Sprintf("%s: %s", msg.name, msg.err.Error())
 		}
@@ -304,8 +326,16 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, openEditor(m.cfgPath)
 
 		case "K":
+			active := tunnel.List()
 			errs := tunnel.StopAll()
-			if len(errs) == 0 {
+			if len(active) == 0 {
+				m.statusMsg = "no active tunnels"
+			} else if len(errs) == 0 {
+				lines := make([]string, len(active))
+				for i, t := range active {
+					lines[i] = "• " + t.Connection.Name
+				}
+				tunnel.Notify("diglet", "all tunnels stopped\n"+strings.Join(lines, "\n"))
 				m.statusMsg = "all tunnels stopped"
 			} else {
 				m.statusMsg = fmt.Sprintf("stopped with %d error(s): %s", len(errs), errs[0].Error())
@@ -329,18 +359,20 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			conn := m.filtered[m.cursor]
 
-			if m.connecting[conn.Name] {
+			// Ignore enter while connecting — let the probe finish.
+			if tunnel.IsConnecting(conn.Name) {
 				return m, nil
 			}
 
 			if tunnel.IsActive(conn.Name) {
 				if err := tunnel.Stop(conn.Name); err != nil {
 					m.statusMsg = err.Error()
+				} else {
+					tunnel.Notify("diglet", conn.Name+": disconnected")
 				}
 				return m, nil
 			}
 
-			m.connecting[conn.Name] = true
 			return m, startTunnel(conn)
 		}
 	}
@@ -399,7 +431,7 @@ func (m *model) renderPreview(width, height int) string {
 			for _, c := range conns {
 				var indicator string
 				switch {
-				case m.connecting[c.Name]:
+				case tunnel.IsConnecting(c.Name):
 					indicator = connectingStyle.Render("◌")
 				case tunnel.IsActive(c.Name):
 					indicator = activeStyle.Render("●")
@@ -422,7 +454,7 @@ func (m *model) renderPreview(width, height int) string {
 
 	var status string
 	switch {
-	case m.connecting[conn.Name]:
+	case tunnel.IsConnecting(conn.Name):
 		status = connectingStyle.Render("◌ connecting...")
 	case tunnel.IsActive(conn.Name):
 		status = activeStyle.Render("● active")
@@ -521,7 +553,7 @@ func (m *model) renderList(width, height int) string {
 
 		var indicator, name string
 		switch {
-		case m.connecting[conn.Name]:
+		case tunnel.IsConnecting(conn.Name):
 			indicator = connectingStyle.Render("◌")
 			name = connectingStyle.Render(conn.Name)
 		case tunnel.IsActive(conn.Name):

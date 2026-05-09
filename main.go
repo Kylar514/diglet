@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strconv"
 
 	"github.com/kylar514/diglet/config"
 	"github.com/kylar514/diglet/tui"
@@ -10,6 +11,21 @@ import (
 )
 
 func main() {
+	// Probe subcommand: `diglet probe <name> <localPort>`
+	// Spawned as a detached subprocess by the TUI when a tunnel is started.
+	// Probes the port, updates the state file, and sends desktop notifications.
+	// Runs independently of the TUI and survives the TUI being closed.
+	if len(os.Args) == 4 && os.Args[1] == "probe" {
+		name := os.Args[2]
+		localPort, err := strconv.Atoi(os.Args[3])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "probe: invalid port %q: %v\n", os.Args[3], err)
+			os.Exit(1)
+		}
+		tunnel.RunProbe(name, localPort)
+		os.Exit(0)
+	}
+
 	cfgPath := config.DefaultConfigPath()
 	if len(os.Args) > 1 {
 		cfgPath = os.Args[1]
