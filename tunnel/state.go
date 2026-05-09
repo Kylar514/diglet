@@ -23,6 +23,7 @@ type stateFile_ struct {
 // saveState writes the current active tunnel map to the state file.
 // Called after every Start/Stop.
 func saveState() error {
+	mu.RLock()
 	sf := stateFile_{
 		Tunnels: make(map[string]stateEntry, len(active)),
 	}
@@ -32,6 +33,7 @@ func saveState() error {
 			Connection: t.Connection,
 		}
 	}
+	mu.RUnlock()
 
 	data, err := json.MarshalIndent(sf, "", "  ")
 	if err != nil {
@@ -93,6 +95,7 @@ func Reconcile() {
 	close(results)
 
 	changed := false
+	mu.Lock()
 	for r := range results {
 		if r.alive {
 			active[r.name] = &ActiveTunnel{
@@ -103,6 +106,7 @@ func Reconcile() {
 			changed = true
 		}
 	}
+	mu.Unlock()
 
 	if changed {
 		_ = saveState()

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os/exec"
 	"sort"
+	"sync"
 	"syscall"
 
 	"github.com/kylar514/diglet/config"
@@ -16,6 +17,7 @@ type ActiveTunnel struct {
 }
 
 var (
+	mu       sync.RWMutex
 	active   = map[string]*ActiveTunnel{}
 	builders = map[string]func(config.Connection) (*exec.Cmd, error){}
 )
@@ -25,10 +27,6 @@ func Register(tunnelType string, builder func(config.Connection) (*exec.Cmd, err
 }
 
 func StartProcess(conn config.Connection) error {
-	if _, exists := active[conn.Name]; exists {
-		return fmt.Errorf("tunnel %q already active", conn.Name)
-	}
-
 	builder, ok := builders[conn.TunnelType]
 	if !ok {
 		return fmt.Errorf("unknown tunnel_type %q", conn.TunnelType)
@@ -45,6 +43,15 @@ func StartProcess(conn config.Connection) error {
 		return fmt.Errorf("failed to start tunnel %q: %w", conn.Name, err)
 	}
 
+	mu.Lock()
+	defer mu.Unlock()
+
+	if _, exists := active[conn.Name]; exists {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		_ = syscall.Kill(cmd.Process.Pid, syscall.SIGKILL)
+		return fmt.Errorf("tunnel %q already active", conn.Name)
+	}
+
 	active[conn.Name] = &ActiveTunnel{
 		Connection: conn,
 		Cmd:        cmd,
@@ -55,31 +62,42 @@ func StartProcess(conn config.Connection) error {
 }
 
 func Confirm(name string) error {
-	if _, exists := active[name]; !exists {
+	mu.RLock()
+	_, exists := active[name]
+	mu.RUnlock()
+	if !exists {
 		return fmt.Errorf("no active tunnel named %q", name)
 	}
 	return saveState()
 }
 
 func Abort(name string) {
+	mu.Lock()
 	t, exists := active[name]
 	if !exists {
+		mu.Unlock()
 		return
 	}
+	delete(active, name)
+	mu.Unlock()
+
 	pid := t.Pid
 	_ = syscall.Kill(-pid, syscall.SIGKILL)
 	_ = syscall.Kill(pid, syscall.SIGKILL)
 	if t.Cmd != nil {
 		_ = t.Cmd.Wait()
 	}
-	delete(active, name)
 }
 
 func Stop(name string) error {
+	mu.Lock()
 	t, exists := active[name]
 	if !exists {
+		mu.Unlock()
 		return fmt.Errorf("no active tunnel named %q", name)
 	}
+	delete(active, name)
+	mu.Unlock()
 
 	pid := t.Pid
 	if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil {
@@ -92,16 +110,12 @@ func Stop(name string) error {
 		_ = t.Cmd.Wait()
 	}
 
-	delete(active, name)
-
-	if err := saveState(); err != nil {
-		_ = err
-	}
-
-	return nil
+	return saveState()
 }
 
 func List() []*ActiveTunnel {
+	mu.RLock()
+	defer mu.RUnlock()
 	tunnels := make([]*ActiveTunnel, 0, len(active))
 	for _, t := range active {
 		tunnels = append(tunnels, t)
@@ -110,6 +124,8 @@ func List() []*ActiveTunnel {
 }
 
 func IsActive(name string) bool {
+	mu.RLock()
+	defer mu.RUnlock()
 	_, exists := active[name]
 	return exists
 }
@@ -125,6 +141,8 @@ func RegisteredTypes() []string {
 
 // GetPid returns the PID of the named active tunnel, or 0 if not active.
 func GetPid(name string) int {
+	mu.RLock()
+	defer mu.RUnlock()
 	if t, exists := active[name]; exists {
 		return t.Pid
 	}
@@ -134,8 +152,15 @@ func GetPid(name string) int {
 // StopAll stops every active tunnel. Returns a slice of any errors encountered.
 // Tunnels that fail to stop are left in the active map.
 func StopAll() []error {
-	var errs []error
+	mu.RLock()
+	names := make([]string, 0, len(active))
 	for name := range active {
+		names = append(names, name)
+	}
+	mu.RUnlock()
+
+	var errs []error
+	for _, name := range names {
 		if err := Stop(name); err != nil {
 			errs = append(errs, err)
 		}
