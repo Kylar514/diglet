@@ -281,11 +281,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch msg.String() {
 			case "esc", "t":
 				m.mode = modeNormal
-			case "j":
+			case "j", "down":
 				if m.typeCursor < len(types)-1 {
 					m.typeCursor++
 				}
-			case "k":
+			case "k", "up":
 				if m.typeCursor > 0 {
 					m.typeCursor--
 				}
@@ -306,12 +306,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "q", "ctrl+c":
 			return m, tea.Quit
 
-		case "j":
+		case "j", "down":
 			if m.cursor < len(m.filtered)-1 {
 				m.cursor++
 			}
 
-		case "k":
+		case "k", "up":
 			if m.cursor > 0 {
 				m.cursor--
 			}

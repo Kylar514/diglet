@@ -44,7 +44,7 @@ config directory (`~/.config/diglet/connections.yaml` on Linux and
 
 | Key     | Action                   |
 | ------- | ------------------------ |
-| `j`/`k` | Navigate list            |
+| `j`/`k` or `↑`/`↓` | Navigate list     |
 | `Enter` | Toggle tunnel on/off     |
 | `/`     | Fuzzy-filter connections |
 | `t`     | Filter by tunnel type    |
