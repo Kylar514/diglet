@@ -38,8 +38,9 @@ go build -o diglet .
 
 ## Usage
 
-Run `diglet`. On first launch it scaffolds a config file at
-`~/.config/diglet/connections.yaml`.
+Run `diglet`. On first launch it scaffolds a config file in the platform's user
+config directory (`~/.config/diglet/connections.yaml` on Linux and
+`%AppData%\diglet\connections.yaml` on Windows).
 
 | Key     | Action                   |
 | ------- | ------------------------ |
@@ -53,7 +54,9 @@ Run `diglet`. On first launch it scaffolds a config file at
 
 ## Config
 
-`~/.config/diglet/connections.yaml`:
+Linux path: `~/.config/diglet/connections.yaml`
+
+Windows path: `%AppData%\diglet\connections.yaml`
 
 ```yaml
 connections:
@@ -79,10 +82,33 @@ connections:
 Adding a new type: create a file in `tunnel/` with an `init()` that calls
 `tunnel.Register()`.
 
-## Session Recovery
+## Status from the CLI
 
-Active tunnels are persisted to `/tmp/diglet-state.json` and automatically
-restored on restart. Zombie processes are detected and cleaned up.
+`diglet status` prints the name of each active tunnel, one per line. Perfect
+for waybar or any status bar:
+
+```jsonc
+"custom/diglet": {
+  "exec": "diglet status",
+  "interval": 2,
+  "format": "{}"
+}
+```
+
+Empty output = no tunnels = waybar hides the module. Exit code is 0 when any
+tunnel is active, 1 when none are active, and 2 on an error.
+
+## Tunnel state
+
+Diglet reads the operating system's listener table to determine live status.
+It stores only enough process metadata in the user cache directory to prove
+that a process belongs to Diglet before stopping it. An unrelated process on a
+configured port is shown as occupied and is never killed.
+
+Linux status inspection requires `ss`. Windows uses the built-in `netstat`.
+Both platforms require `ssh` or `kubectl` in `PATH` for their respective tunnel
+types. Desktop notifications currently require `notify-send` and are therefore
+Linux-only.
 
 ## License
 

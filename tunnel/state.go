@@ -2,229 +2,198 @@ package tunnel
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
-	"syscall"
+	"path/filepath"
+	"time"
 
 	"github.com/kylar514/diglet/config"
 )
 
-const stateFile = "/tmp/diglet-state.json"
+type Status int
 
 const (
-	stateConnecting = "connecting"
-	stateActive     = "active"
+	StatusInactive Status = iota
+	StatusConnecting
+	StatusActive
+	StatusOccupied
 )
 
-type stateEntry struct {
-	Pid        int               `json:"pid"`
-	Status     string            `json:"status"`
-	Connection config.Connection `json:"connection"`
+type Info struct {
+	Status Status
+	PID    int
+	Owner  string
 }
 
-type stateFile_ struct {
+type stateEntry struct {
+	Connection config.Connection `json:"connection"`
+	PID        int               `json:"pid"`
+	Identity   uint64            `json:"identity"`
+}
+
+type stateFile struct {
 	Tunnels map[string]stateEntry `json:"tunnels"`
 }
 
-// readStateFile reads and parses the state file. Returns an empty map on any error.
-func readStateFile() stateFile_ {
-	data, err := os.ReadFile(stateFile)
+func statePath() (string, error) {
+	dir, err := os.UserCacheDir()
 	if err != nil {
-		return stateFile_{Tunnels: map[string]stateEntry{}}
+		return "", fmt.Errorf("could not locate user cache directory: %w", err)
 	}
-	var sf stateFile_
-	if err := json.Unmarshal(data, &sf); err != nil {
-		return stateFile_{Tunnels: map[string]stateEntry{}}
-	}
-	if sf.Tunnels == nil {
-		sf.Tunnels = map[string]stateEntry{}
-	}
-	return sf
+	return filepath.Join(dir, "diglet", "state.json"), nil
 }
 
-// writeStateFile serializes and writes the state file atomically.
-func writeStateFile(sf stateFile_) error {
-	data, err := json.MarshalIndent(sf, "", "  ")
+func withState(fn func(*stateFile) (bool, error)) error {
+	path, err := statePath()
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(stateFile, data, 0o600)
-}
-
-// saveState writes the full in-memory active map to the state file,
-// including connecting entries so they survive TUI restarts.
-func saveState() error {
-	mu.RLock()
-	sf := stateFile_{
-		Tunnels: make(map[string]stateEntry, len(active)),
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
 	}
-	for name, t := range active {
-		status := stateActive
-		if t.Status == StatusConnecting {
-			status = stateConnecting
+	lock := path + ".lock"
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		file, err := os.OpenFile(lock, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err == nil {
+			_ = file.Close()
+			break
 		}
-		sf.Tunnels[name] = stateEntry{
-			Pid:        t.Pid,
-			Status:     status,
-			Connection: t.Connection,
+		if !errors.Is(err, os.ErrExist) || time.Now().After(deadline) {
+			return fmt.Errorf("could not lock tunnel registry: %w", err)
 		}
+		if info, statErr := os.Stat(lock); statErr == nil && time.Since(info.ModTime()) > 10*time.Second {
+			_ = os.Remove(lock)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
-	mu.RUnlock()
-	return writeStateFile(sf)
-}
+	defer os.Remove(lock)
 
-// UpdateEntryStatus reads the state file, updates a single entry's status,
-// and writes it back. Called by the probe subprocess (separate process).
-func UpdateEntryStatus(name, status string) error {
-	sf := readStateFile()
-	entry, ok := sf.Tunnels[name]
-	if !ok {
-		return nil // tunnel was stopped while probe was running — no-op
-	}
-	entry.Status = status
-	sf.Tunnels[name] = entry
-	return writeStateFile(sf)
-}
-
-// RemoveEntry reads the state file, removes a single entry, and writes it back.
-// Called by the probe subprocess on failure.
-func RemoveEntry(name string) error {
-	sf := readStateFile()
-	delete(sf.Tunnels, name)
-	return writeStateFile(sf)
-}
-
-// RefreshFromState reads the state file and syncs the in-memory active map.
-// Entries present in the file but not in memory are added (e.g. restored after
-// the TUI was closed while a probe was running). Entries in memory but not in
-// the file (e.g. stopped externally) are removed.
-func RefreshFromState() {
-	sf := readStateFile()
-
-	mu.Lock()
-	defer mu.Unlock()
-
-	// Add or update entries from the state file.
-	for name, entry := range sf.Tunnels {
-		status := StatusActive
-		if entry.Status == stateConnecting {
-			status = StatusConnecting
+	state := stateFile{Tunnels: map[string]stateEntry{}}
+	if data, err := os.ReadFile(path); err == nil {
+		if err := json.Unmarshal(data, &state); err != nil {
+			return fmt.Errorf("could not read tunnel registry: %w", err)
 		}
-		if existing, ok := active[name]; ok {
-			// Update status only — don't overwrite Cmd which we may still hold.
-			existing.Status = status
-		} else {
-			active[name] = &ActiveTunnel{
-				Connection: entry.Connection,
-				Pid:        entry.Pid,
-				Status:     status,
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if state.Tunnels == nil {
+		state.Tunnels = map[string]stateEntry{}
+	}
+	changed, err := fn(&state)
+	if err != nil || !changed {
+		return err
+	}
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), "state-*.json")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0o600); err == nil {
+		_, err = tmp.Write(data)
+	}
+	if closeErr := tmp.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	return replaceFile(tmpName, path)
+}
+
+func Statuses(connections []config.Connection) (map[string]Info, error) {
+	ports, err := listeningPorts()
+	if err != nil {
+		return nil, err
+	}
+	statuses := make(map[string]Info, len(connections))
+	err = withState(func(state *stateFile) (bool, error) {
+		changed := false
+		for name, entry := range state.Tunnels {
+			identity, err := processIdentity(entry.PID)
+			if err != nil || identity != entry.Identity {
+				delete(state.Tunnels, name)
+				changed = true
 			}
 		}
-	}
-
-	// Remove entries that are no longer in the state file.
-	for name := range active {
-		if _, ok := sf.Tunnels[name]; !ok {
-			delete(active, name)
+		owners := make(map[int]stateEntry, len(state.Tunnels))
+		for _, entry := range state.Tunnels {
+			owners[entry.Connection.LocalPort] = entry
 		}
-	}
+		for _, connection := range connections {
+			entry, owned := state.Tunnels[connection.Name]
+			listeners, listening := ports[connection.LocalPort]
+			switch {
+			case owned && listening && listeners[entry.PID]:
+				statuses[connection.Name] = Info{Status: StatusActive, PID: entry.PID}
+			case owned && listening:
+				statuses[connection.Name] = Info{Status: StatusOccupied, PID: entry.PID}
+			case owned:
+				statuses[connection.Name] = Info{Status: StatusConnecting, PID: entry.PID}
+			case listening:
+				info := Info{Status: StatusOccupied}
+				if owner, exists := owners[connection.LocalPort]; exists && listeners[owner.PID] {
+					info.Owner = owner.Connection.Name
+				}
+				statuses[connection.Name] = info
+			default:
+				statuses[connection.Name] = Info{Status: StatusInactive}
+			}
+		}
+		return changed, nil
+	})
+	return statuses, err
 }
 
-// Reconcile reads the state file on startup and health-checks each entry:
-//   - connecting + pid alive  → restore as StatusConnecting (probe subprocess still running)
-//   - connecting + pid dead   → remove entry (probe subprocess crashed)
-//   - active + pid alive + port up   → restore as StatusActive
-//   - active + pid alive + port down → kill zombie, remove entry
-//   - active + pid dead       → remove entry
-func Reconcile() {
-	sf := readStateFile()
-	if len(sf.Tunnels) == 0 {
-		return
-	}
-
-	type result struct {
-		name   string
-		entry  stateEntry
-		keep   bool
-		status TunnelStatus
-	}
-
-	resultCh := make(chan result, len(sf.Tunnels))
-
-	for name, entry := range sf.Tunnels {
-		go func(name string, entry stateEntry) {
-			if !pidAlive(entry.Pid) {
-				resultCh <- result{name: name, entry: entry, keep: false}
-				return
-			}
-
-			if entry.Status == stateConnecting {
-				// Probe subprocess is still running — restore as connecting.
-				resultCh <- result{name: name, entry: entry, keep: true, status: StatusConnecting}
-				return
-			}
-
-			// Active entry — verify port is still reachable.
-			if err := Probe(entry.Connection.LocalPort); err != nil {
-				_ = syscall.Kill(-entry.Pid, syscall.SIGKILL)
-				_ = syscall.Kill(entry.Pid, syscall.SIGKILL)
-				resultCh <- result{name: name, entry: entry, keep: false}
-				return
-			}
-			resultCh <- result{name: name, entry: entry, keep: true, status: StatusActive}
-		}(name, entry)
-	}
-
-	changed := false
-	mu.Lock()
-	for range sf.Tunnels {
-		r := <-resultCh
-		if r.keep {
-			active[r.name] = &ActiveTunnel{
-				Connection: r.entry.Connection,
-				Pid:        r.entry.Pid,
-				Status:     r.status,
-			}
-		} else {
-			changed = true
+func addEntry(connection config.Connection, pid int, identity uint64) error {
+	return withState(func(state *stateFile) (bool, error) {
+		if _, exists := state.Tunnels[connection.Name]; exists {
+			return false, fmt.Errorf("tunnel %q is already running", connection.Name)
 		}
-	}
-	mu.Unlock()
-	close(resultCh)
-
-	if changed {
-		_ = saveState()
-	}
+		for _, entry := range state.Tunnels {
+			if entry.Connection.LocalPort == connection.LocalPort {
+				return false, fmt.Errorf("port %d is already owned by %q", connection.LocalPort, entry.Connection.Name)
+			}
+		}
+		state.Tunnels[connection.Name] = stateEntry{Connection: connection, PID: pid, Identity: identity}
+		return true, nil
+	})
 }
 
-// RunProbe is the entrypoint for the `diglet probe` subprocess.
-// It probes localPort, updates the state file, and sends notifications.
-func RunProbe(name string, localPort int) {
-	NotifySync("diglet", name+": connecting...")
-
-	if err := Probe(localPort); err != nil {
-		// Probe timed out — read pid before removing the entry.
-		sf := readStateFile()
-		_ = RemoveEntry(name)
-		if entry, ok := sf.Tunnels[name]; ok {
-			_ = syscall.Kill(-entry.Pid, syscall.SIGKILL)
-			_ = syscall.Kill(entry.Pid, syscall.SIGKILL)
-		}
-		NotifySync("diglet", name+": failed to connect")
-		return
-	}
-
-	// Port is up — mark active in state file.
-	if err := UpdateEntryStatus(name, stateActive); err != nil {
-		NotifySync("diglet", name+": failed to update state")
-		return
-	}
-	NotifySync("diglet", name+": connected")
+func entryFor(name string) (stateEntry, bool, error) {
+	var entry stateEntry
+	var found bool
+	err := withState(func(state *stateFile) (bool, error) {
+		entry, found = state.Tunnels[name]
+		return false, nil
+	})
+	return entry, found, err
 }
 
-// pidAlive returns true if the process with the given PID is running.
-func pidAlive(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	return syscall.Kill(pid, 0) == nil
+func removeEntry(name string, pid int, identity uint64) error {
+	return withState(func(state *stateFile) (bool, error) {
+		entry, exists := state.Tunnels[name]
+		if !exists || entry.PID != pid || entry.Identity != identity {
+			return false, nil
+		}
+		delete(state.Tunnels, name)
+		return true, nil
+	})
+}
+
+func allEntries() ([]stateEntry, error) {
+	var entries []stateEntry
+	err := withState(func(state *stateFile) (bool, error) {
+		for _, entry := range state.Tunnels {
+			entries = append(entries, entry)
+		}
+		return false, nil
+	})
+	return entries, err
 }

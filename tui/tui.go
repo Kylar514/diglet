@@ -1,12 +1,12 @@
 package tui
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
-	"strconv"
+	"runtime"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -43,17 +43,18 @@ const (
 	modeType
 )
 
-// tickMsg is sent by the polling ticker to trigger a state file refresh.
-type tickMsg struct{}
+type tickMsg struct {
+	statuses map[string]tunnel.Info
+	revision int
+	err      error
+}
 
-// tunnelStartedMsg is sent back to Update() immediately after the OS process
-// is spawned. A non-nil err means the process failed to start.
 type tunnelStartedMsg struct {
 	name string
+	pid  int
 	err  error
 }
 
-// editorFinishedMsg is sent back to Update() after the editor process exits.
 type editorFinishedMsg struct{ err error }
 
 type model struct {
@@ -65,6 +66,8 @@ type model struct {
 	filter      textinput.Model
 	typeFilter  string
 	statusMsg   string
+	statuses    map[string]tunnel.Info
+	revision    int
 	cfgPath     string
 	width       int
 	height      int
@@ -81,27 +84,25 @@ func newModel(cfg *config.Config, cfgPath string) model {
 		filter:      ti,
 		typeFilter:  "all",
 		cfgPath:     cfgPath,
+		statuses:    map[string]tunnel.Info{},
 	}
 }
 
 func (m *model) Init() tea.Cmd {
-	return tick()
+	return tick(m.connections, m.revision)
 }
 
-// tick returns a tea.Cmd that fires a tickMsg after 500ms.
-func tick() tea.Cmd {
+func tick(connections []config.Connection, revision int) tea.Cmd {
 	return tea.Tick(500*time.Millisecond, func(time.Time) tea.Msg {
-		return tickMsg{}
+		statuses, err := tunnel.Statuses(connections)
+		return tickMsg{statuses: statuses, revision: revision, err: err}
 	})
 }
 
-// typeList returns the full ordered list of selectable type entries: "all" first,
-// then registered tunnel types alphabetically.
 func (m *model) typeList() []string {
 	return append([]string{"all"}, tunnel.RegisteredTypes()...)
 }
 
-// typeCount returns the number of connections matching a given type ("all" returns total).
 func (m *model) typeCount(t string) int {
 	if t == "all" {
 		return len(m.connections)
@@ -115,7 +116,6 @@ func (m *model) typeCount(t string) int {
 	return n
 }
 
-// connectionsOfType returns all connections matching a given type ("all" returns all).
 func (m *model) connectionsOfType(t string) []config.Connection {
 	if t == "all" {
 		return m.connections
@@ -156,15 +156,17 @@ func (m *model) applyTypeFilter() {
 	m.cursor = 0
 }
 
-// openEditor suspends the TUI, opens the best available editor on the config
-// file, then resumes. Preference: $EDITOR → $VISUAL → vim → vi → error.
 func openEditor(cfgPath string) tea.Cmd {
 	editor := os.Getenv("EDITOR")
 	if editor == "" {
 		editor = os.Getenv("VISUAL")
 	}
 	if editor == "" {
-		for _, candidate := range []string{"vim", "vi"} {
+		candidates := []string{"vim", "vi"}
+		if runtime.GOOS == "windows" {
+			candidates = []string{"notepad"}
+		}
+		for _, candidate := range candidates {
 			if _, err := exec.LookPath(candidate); err == nil {
 				editor = candidate
 				break
@@ -173,7 +175,7 @@ func openEditor(cfgPath string) tea.Cmd {
 	}
 	if editor == "" {
 		return func() tea.Msg {
-			return editorFinishedMsg{err: fmt.Errorf("no editor found: set $EDITOR or install vim")}
+			return editorFinishedMsg{err: fmt.Errorf("no editor found: set $EDITOR")}
 		}
 	}
 	return tea.ExecProcess(exec.Command(editor, cfgPath), func(err error) tea.Msg {
@@ -181,41 +183,50 @@ func openEditor(cfgPath string) tea.Cmd {
 	})
 }
 
-// startTunnel spawns the tunnel OS process and a detached probe subprocess,
-// then returns immediately. The probe subprocess survives the TUI being closed
-// and updates the state file when the connection succeeds or fails.
 func startTunnel(conn config.Connection) tea.Cmd {
 	return func() tea.Msg {
-		if err := tunnel.StartProcess(conn); err != nil {
+		pid, err := tunnel.Start(conn)
+		if err != nil {
 			return tunnelStartedMsg{name: conn.Name, err: err}
 		}
 
-		// Spawn a detached `diglet probe <name> <port>` subprocess.
-		// Setpgid isolates it from the TUI process group so it survives `q`.
-		exe, err := os.Executable()
-		if err != nil {
-			return tunnelStartedMsg{name: conn.Name, err: fmt.Errorf("could not locate executable: %w", err)}
-		}
-		probe := exec.Command(exe, "probe", conn.Name, strconv.Itoa(conn.LocalPort))
-		probe.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-		if err := probe.Start(); err != nil {
-			return tunnelStartedMsg{name: conn.Name, err: fmt.Errorf("could not start probe: %w", err)}
+		if err := tunnel.StartProbe(conn.Name, conn.LocalPort, pid); err != nil {
+			if stopErr := tunnel.Stop(conn); stopErr != nil {
+				err = errors.Join(err, fmt.Errorf("cleanup failed: %w", stopErr))
+			}
+			return tunnelStartedMsg{name: conn.Name, err: err}
 		}
 
-		return tunnelStartedMsg{name: conn.Name, err: nil}
+		return tunnelStartedMsg{name: conn.Name, pid: pid}
 	}
 }
 
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tickMsg:
-		tunnel.RefreshFromState()
-		return m, tick()
+		if msg.revision != m.revision {
+			return m, tick(m.connections, m.revision)
+		}
+		if msg.err != nil {
+			m.statusMsg = msg.err.Error()
+		} else {
+			for name, info := range m.statuses {
+				if info.Status == tunnel.StatusConnecting && info.PID == 0 && msg.statuses[name].Status == tunnel.StatusInactive {
+					msg.statuses[name] = info
+				}
+			}
+			m.statuses = msg.statuses
+		}
+		return m, tick(m.connections, m.revision)
 
 	case tunnelStartedMsg:
 		if msg.err != nil {
 			m.statusMsg = fmt.Sprintf("%s: %s", msg.name, msg.err.Error())
+			m.statuses[msg.name] = tunnel.Info{Status: tunnel.StatusInactive}
+		} else {
+			m.statuses[msg.name] = tunnel.Info{Status: tunnel.StatusConnecting, PID: msg.pid}
 		}
+		m.revision++
 		return m, nil
 
 	case editorFinishedMsg:
@@ -223,19 +234,17 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusMsg = fmt.Sprintf("editor: %s", msg.err.Error())
 			return m, nil
 		}
-		// Reload config; on parse error keep existing connections and show error.
 		newCfg, err := config.Load(m.cfgPath)
 		if err != nil {
 			m.statusMsg = fmt.Sprintf("config reload failed: %s", err.Error())
 			return m, nil
 		}
 		m.connections = newCfg.Connections
-		// Re-apply current filters so the list reflects the updated config.
+		m.revision++
 		m.applyTypeFilter()
 		if m.filter.Value() != "" {
 			m.applyFilter()
 		}
-		// Clamp cursor in case the list shrank.
 		if m.cursor >= len(m.filtered) {
 			m.cursor = max(0, len(m.filtered)-1)
 		}
@@ -248,7 +257,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		m.statusMsg = ""
 
-		// --- filter mode ---
 		if m.mode == modeFilter {
 			switch msg.String() {
 			case "esc":
@@ -268,7 +276,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 
-		// --- type mode ---
 		if m.mode == modeType {
 			types := m.typeList()
 			switch msg.String() {
@@ -289,14 +296,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "enter":
 				m.typeFilter = types[m.typeCursor]
 				m.applyTypeFilter()
-				// Clear any active fuzzy filter when switching type.
 				m.filter.SetValue("")
 				m.mode = modeNormal
 			}
 			return m, nil
 		}
 
-		// --- normal mode ---
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
@@ -326,25 +331,25 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, openEditor(m.cfgPath)
 
 		case "K":
-			active := tunnel.List()
-			errs := tunnel.StopAll()
-			if len(active) == 0 {
+			names, errs := tunnel.StopAll()
+			if len(names) == 0 && len(errs) == 0 {
 				m.statusMsg = "no active tunnels"
-			} else if len(errs) == 0 {
-				lines := make([]string, len(active))
-				for i, t := range active {
-					lines[i] = "• " + t.Connection.Name
+				return m, nil
+			}
+			if len(errs) == 0 {
+				for _, name := range names {
+					m.statuses[name] = tunnel.Info{Status: tunnel.StatusInactive}
 				}
-				tunnel.Notify("diglet", "all tunnels stopped\n"+strings.Join(lines, "\n"))
+				tunnel.Notify("diglet", "all tunnels stopped\n"+strings.Join(names, "\n"))
 				m.statusMsg = "all tunnels stopped"
 			} else {
 				m.statusMsg = fmt.Sprintf("stopped with %d error(s): %s", len(errs), errs[0].Error())
 			}
+			m.revision++
 			return m, nil
 
 		case "t":
 			m.mode = modeType
-			// Position the type cursor on the currently active filter.
 			types := m.typeList()
 			for i, t := range types {
 				if t == m.typeFilter {
@@ -359,20 +364,41 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			conn := m.filtered[m.cursor]
 
-			// Ignore enter while connecting — let the probe finish.
-			if tunnel.IsConnecting(conn.Name) {
-				return m, nil
-			}
-
-			if tunnel.IsActive(conn.Name) {
-				if err := tunnel.Stop(conn.Name); err != nil {
+			switch m.statuses[conn.Name].Status {
+			case tunnel.StatusConnecting:
+				if m.statuses[conn.Name].PID == 0 {
+					return m, nil
+				}
+				fallthrough
+			case tunnel.StatusActive:
+				if err := tunnel.Stop(conn); err != nil {
 					m.statusMsg = err.Error()
 				} else {
+					m.statuses[conn.Name] = tunnel.Info{Status: tunnel.StatusInactive}
 					tunnel.Notify("diglet", conn.Name+": disconnected")
+				}
+				m.revision++
+				return m, nil
+			case tunnel.StatusOccupied:
+				if m.statuses[conn.Name].PID > 0 {
+					if err := tunnel.Stop(conn); err != nil {
+						m.statusMsg = err.Error()
+					} else {
+						m.statuses[conn.Name] = tunnel.Info{Status: tunnel.StatusInactive}
+					}
+					m.revision++
+					return m, nil
+				}
+				if owner := m.statuses[conn.Name].Owner; owner != "" {
+					m.statusMsg = fmt.Sprintf("port %d is currently used by tunnel %q", conn.LocalPort, owner)
+				} else {
+					m.statusMsg = fmt.Sprintf("port %d is occupied by a process not owned by diglet", conn.LocalPort)
 				}
 				return m, nil
 			}
 
+			m.statuses[conn.Name] = tunnel.Info{Status: tunnel.StatusConnecting}
+			m.revision++
 			return m, startTunnel(conn)
 		}
 	}
@@ -380,12 +406,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// hotkey renders a single [key] label pair.
 func hotkey(key, label string) string {
 	return keyStyle.Render("["+key+"]") + " " + dimStyle.Render(label)
 }
 
-// buildCommand returns the CLI command string for the preview pane.
 func buildCommand(conn config.Connection) string {
 	switch conn.TunnelType {
 	case "ssh":
@@ -409,10 +433,36 @@ func buildCommand(conn config.Connection) string {
 	}
 }
 
+func (m *model) statusIndicator(conn config.Connection) (glyph, name string) {
+	switch m.statuses[conn.Name].Status {
+	case tunnel.StatusActive:
+		return activeStyle.Render("●"), activeStyle.Render(conn.Name)
+	case tunnel.StatusConnecting:
+		return connectingStyle.Render("◌"), connectingStyle.Render(conn.Name)
+	case tunnel.StatusOccupied:
+		return errorStyle.Render("!"), errorStyle.Render(conn.Name)
+	}
+	return dimStyle.Render("○"), conn.Name
+}
+
+func (m *model) statusLabel(conn config.Connection) string {
+	switch m.statuses[conn.Name].Status {
+	case tunnel.StatusActive:
+		return activeStyle.Render("● active")
+	case tunnel.StatusConnecting:
+		return connectingStyle.Render("◌ connecting")
+	case tunnel.StatusOccupied:
+		if owner := m.statuses[conn.Name].Owner; owner != "" {
+			return errorStyle.Render("! occupied by " + owner)
+		}
+		return errorStyle.Render("! port occupied")
+	}
+	return dimStyle.Render("○ inactive")
+}
+
 func (m *model) renderPreview(width, height int) string {
 	ps := previewStyle.Width(width).Height(height)
 
-	// In type mode: show the connections belonging to the hovered type.
 	if m.mode == modeType {
 		types := m.typeList()
 		hovered := types[m.typeCursor]
@@ -429,15 +479,7 @@ func (m *model) renderPreview(width, height int) string {
 			sb.WriteString(dimStyle.Render("no connections of this type"))
 		} else {
 			for _, c := range conns {
-				var indicator string
-				switch {
-				case tunnel.IsConnecting(c.Name):
-					indicator = connectingStyle.Render("◌")
-				case tunnel.IsActive(c.Name):
-					indicator = activeStyle.Render("●")
-				default:
-					indicator = dimStyle.Render("○")
-				}
+				indicator, _ := m.statusIndicator(c)
 				sb.WriteString(fmt.Sprintf("%s  %s\n", indicator, c.Name))
 			}
 		}
@@ -445,22 +487,12 @@ func (m *model) renderPreview(width, height int) string {
 		return ps.Render(sb.String())
 	}
 
-	// Normal / filter mode: show the selected connection detail.
 	if len(m.filtered) == 0 {
 		return ps.Render(dimStyle.Render("no connections"))
 	}
 
 	conn := m.filtered[m.cursor]
-
-	var status string
-	switch {
-	case tunnel.IsConnecting(conn.Name):
-		status = connectingStyle.Render("◌ connecting...")
-	case tunnel.IsActive(conn.Name):
-		status = activeStyle.Render("● active")
-	default:
-		status = dimStyle.Render("● inactive")
-	}
+	status := m.statusLabel(conn)
 
 	var sb strings.Builder
 	sb.WriteString(titleStyle.Render(conn.Name) + "\n\n")
@@ -480,7 +512,7 @@ func (m *model) renderPreview(width, height int) string {
 
 	sb.WriteString(fmt.Sprintf("%-12s %d → %d\n", dimStyle.Render("ports"), conn.LocalPort, conn.RemotePort))
 	sb.WriteString(fmt.Sprintf("%-12s %s\n", dimStyle.Render("status"), status))
-	pid := tunnel.GetPid(conn.Name)
+	pid := m.statuses[conn.Name].PID
 	pidStr := "n/a"
 	if pid > 0 {
 		pidStr = fmt.Sprintf("%d", pid)
@@ -502,7 +534,6 @@ func (m *model) renderList(width, height int) string {
 	ls := listStyle.Width(width).Height(height)
 	var sb strings.Builder
 
-	// --- type mode ---
 	if m.mode == modeType {
 		types := m.typeList()
 		sb.WriteString(titleStyle.Render("type filter") +
@@ -530,7 +561,6 @@ func (m *model) renderList(width, height int) string {
 		return ls.Render(sb.String())
 	}
 
-	// --- normal / filter mode ---
 	total := len(m.connections)
 	shown := len(m.filtered)
 	header := titleStyle.Render("connections")
@@ -551,19 +581,7 @@ func (m *model) renderList(width, height int) string {
 			cursor = cursorStyle.Render("▶ ")
 		}
 
-		var indicator, name string
-		switch {
-		case tunnel.IsConnecting(conn.Name):
-			indicator = connectingStyle.Render("◌")
-			name = connectingStyle.Render(conn.Name)
-		case tunnel.IsActive(conn.Name):
-			indicator = activeStyle.Render("●")
-			name = activeStyle.Render(conn.Name)
-		default:
-			indicator = dimStyle.Render("○")
-			name = conn.Name
-		}
-
+		indicator, name := m.statusIndicator(conn)
 		typeTag := dimStyle.Render("[" + conn.TunnelType + "]")
 		sb.WriteString(fmt.Sprintf("%s%s %s %s\n", cursor, indicator, name, typeTag))
 	}

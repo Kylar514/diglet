@@ -32,8 +32,12 @@ type Config struct {
 }
 
 func DefaultConfigPath() string {
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".config", "diglet", "connections.yaml")
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		home, _ := os.UserHomeDir()
+		dir = filepath.Join(home, ".config")
+	}
+	return filepath.Join(dir, "diglet", "connections.yaml")
 }
 
 func Load(path string) (*Config, error) {
@@ -46,8 +50,34 @@ func Load(path string) (*Config, error) {
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("could not parse config file: %w", err)
 	}
+	if err := cfg.validate(); err != nil {
+		return nil, fmt.Errorf("invalid config: %w", err)
+	}
 
 	return &cfg, nil
+}
+
+func (cfg Config) validate() error {
+	names := map[string]bool{}
+	for i, connection := range cfg.Connections {
+		if connection.Name == "" {
+			return fmt.Errorf("connection %d has no name", i+1)
+		}
+		if names[connection.Name] {
+			return fmt.Errorf("duplicate connection name %q", connection.Name)
+		}
+		names[connection.Name] = true
+		if connection.TunnelType == "" {
+			return fmt.Errorf("connection %q has no tunnel_type", connection.Name)
+		}
+		if connection.LocalPort < 1 || connection.LocalPort > 65535 {
+			return fmt.Errorf("connection %q has invalid local_port %d", connection.Name, connection.LocalPort)
+		}
+		if connection.RemotePort < 1 || connection.RemotePort > 65535 {
+			return fmt.Errorf("connection %q has invalid remote_port %d", connection.Name, connection.RemotePort)
+		}
+	}
+	return nil
 }
 
 // IsNotExist reports whether the error from Load indicates the config file

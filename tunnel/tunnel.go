@@ -4,139 +4,98 @@ import (
 	"fmt"
 	"os/exec"
 	"sort"
-	"sync"
-	"syscall"
 
 	"github.com/kylar514/diglet/config"
 )
 
-type TunnelStatus int
-
-const (
-	StatusConnecting TunnelStatus = iota
-	StatusActive
-)
-
-type ActiveTunnel struct {
-	Connection config.Connection
-	Cmd        *exec.Cmd
-	Pid        int
-	Status     TunnelStatus
-}
-
-var (
-	mu       sync.RWMutex
-	active   = map[string]*ActiveTunnel{}
-	builders = map[string]func(config.Connection) (*exec.Cmd, error){}
-)
+var builders = map[string]func(config.Connection) (*exec.Cmd, error){}
 
 func Register(tunnelType string, builder func(config.Connection) (*exec.Cmd, error)) {
 	builders[tunnelType] = builder
 }
 
-func StartProcess(conn config.Connection) error {
+func Start(conn config.Connection) (int, error) {
+	statuses, err := Statuses([]config.Connection{conn})
+	if err != nil {
+		return 0, err
+	}
+	switch statuses[conn.Name].Status {
+	case StatusActive, StatusConnecting:
+		return 0, fmt.Errorf("tunnel %q is already running", conn.Name)
+	case StatusOccupied:
+		if owner := statuses[conn.Name].Owner; owner != "" {
+			return 0, fmt.Errorf("port %d is currently used by tunnel %q", conn.LocalPort, owner)
+		}
+		return 0, fmt.Errorf("port %d is occupied by a process not owned by diglet", conn.LocalPort)
+	}
 	builder, ok := builders[conn.TunnelType]
 	if !ok {
-		return fmt.Errorf("unknown tunnel_type %q", conn.TunnelType)
+		return 0, fmt.Errorf("unknown tunnel_type %q", conn.TunnelType)
 	}
-
 	cmd, err := builder(conn)
 	if err != nil {
-		return fmt.Errorf("tunnel %q: %w", conn.Name, err)
+		return 0, fmt.Errorf("tunnel %q: %w", conn.Name, err)
 	}
-
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-
+	prepareCommand(cmd)
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("failed to start tunnel %q: %w", conn.Name, err)
+		return 0, fmt.Errorf("failed to start tunnel %q: %w", conn.Name, err)
 	}
-
-	mu.Lock()
-	if _, exists := active[conn.Name]; exists {
-		mu.Unlock()
-		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		_ = syscall.Kill(cmd.Process.Pid, syscall.SIGKILL)
-		return fmt.Errorf("tunnel %q already active", conn.Name)
+	pid := cmd.Process.Pid
+	identity, err := processIdentity(pid)
+	if err != nil {
+		if stopErr := terminateProcess(pid); stopErr != nil {
+			return 0, fmt.Errorf("could not identify tunnel %q process: %v; cleanup failed: %w", conn.Name, err, stopErr)
+		}
+		return 0, fmt.Errorf("could not identify tunnel %q process: %w", conn.Name, err)
 	}
-	active[conn.Name] = &ActiveTunnel{
-		Connection: conn,
-		Cmd:        cmd,
-		Pid:        cmd.Process.Pid,
-		Status:     StatusConnecting,
+	if err := addEntry(conn, pid, identity); err != nil {
+		if stopErr := terminateProcess(pid); stopErr != nil {
+			return 0, fmt.Errorf("%v; cleanup failed: %w", err, stopErr)
+		}
+		return 0, err
 	}
-	mu.Unlock()
-
-	// Persist the connecting entry immediately so it survives TUI restarts.
-	return saveState()
+	go func() { _ = cmd.Wait() }()
+	return pid, nil
 }
 
-func Abort(name string) {
-	mu.Lock()
-	t, exists := active[name]
-	if !exists {
-		mu.Unlock()
-		return
-	}
-	delete(active, name)
-	mu.Unlock()
-
-	pid := t.Pid
-	_ = syscall.Kill(-pid, syscall.SIGKILL)
-	_ = syscall.Kill(pid, syscall.SIGKILL)
-	if t.Cmd != nil {
-		_ = t.Cmd.Wait()
-	}
+func Stop(conn config.Connection) error {
+	return stop(conn.Name, 0)
 }
 
-func Stop(name string) error {
-	mu.Lock()
-	t, exists := active[name]
-	if !exists {
-		mu.Unlock()
-		return fmt.Errorf("no active tunnel named %q", name)
+func StopAll() ([]string, []error) {
+	var stopped []string
+	var errs []error
+	entries, err := allEntries()
+	if err != nil {
+		return nil, []error{err}
 	}
-	delete(active, name)
-	mu.Unlock()
-
-	pid := t.Pid
-	if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil {
-		if err2 := syscall.Kill(pid, syscall.SIGKILL); err2 != nil {
-			return fmt.Errorf("failed to kill tunnel %q (pid %d): %w", name, pid, err2)
+	for _, entry := range entries {
+		if err := stop(entry.Connection.Name, entry.PID); err != nil {
+			errs = append(errs, err)
+		} else {
+			stopped = append(stopped, entry.Connection.Name)
 		}
 	}
+	return stopped, errs
+}
 
-	if t.Cmd != nil {
-		_ = t.Cmd.Wait()
+func stop(name string, expectedPID int) error {
+	entry, exists, err := entryFor(name)
+	if err != nil {
+		return err
 	}
-
-	return saveState()
-}
-
-func List() []*ActiveTunnel {
-	mu.RLock()
-	defer mu.RUnlock()
-	tunnels := make([]*ActiveTunnel, 0, len(active))
-	for _, t := range active {
-		tunnels = append(tunnels, t)
+	if !exists || expectedPID != 0 && entry.PID != expectedPID {
+		return fmt.Errorf("no tunnel owned by diglet named %q", name)
 	}
-	return tunnels
-}
-
-// IsActive returns true only if the tunnel is fully connected (StatusActive).
-func IsActive(name string) bool {
-	mu.RLock()
-	defer mu.RUnlock()
-	t, exists := active[name]
-	return exists && t.Status == StatusActive
-}
-
-// IsConnecting returns true if the tunnel process is running but the probe
-// has not yet completed.
-func IsConnecting(name string) bool {
-	mu.RLock()
-	defer mu.RUnlock()
-	t, exists := active[name]
-	return exists && t.Status == StatusConnecting
+	identity, err := processIdentity(entry.PID)
+	if err != nil || identity != entry.Identity {
+		_ = removeEntry(name, entry.PID, entry.Identity)
+		return fmt.Errorf("tunnel %q is no longer running", name)
+	}
+	if err := terminateProcess(entry.PID); err != nil {
+		return fmt.Errorf("failed to stop tunnel %q: %w", name, err)
+	}
+	return removeEntry(name, entry.PID, entry.Identity)
 }
 
 func RegisteredTypes() []string {
@@ -146,33 +105,4 @@ func RegisteredTypes() []string {
 	}
 	sort.Strings(types)
 	return types
-}
-
-// GetPid returns the PID of the named active tunnel, or 0 if not active.
-func GetPid(name string) int {
-	mu.RLock()
-	defer mu.RUnlock()
-	if t, exists := active[name]; exists {
-		return t.Pid
-	}
-	return 0
-}
-
-// StopAll stops every active tunnel. Returns a slice of any errors encountered.
-// Tunnels that fail to stop are left in the active map.
-func StopAll() []error {
-	mu.RLock()
-	names := make([]string, 0, len(active))
-	for name := range active {
-		names = append(names, name)
-	}
-	mu.RUnlock()
-
-	var errs []error
-	for _, name := range names {
-		if err := Stop(name); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	return errs
 }
